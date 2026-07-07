@@ -21,6 +21,8 @@ import static com.google.common.base.Preconditions.checkNotNull;
 
 import android.content.Context;
 import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
 import androidx.annotation.Nullable;
 import androidx.media3.common.AdViewProvider;
 import androidx.media3.common.C;
@@ -38,6 +40,9 @@ import androidx.media3.exoplayer.drm.DrmSessionManagerProvider;
 import androidx.media3.exoplayer.source.ads.AdsLoader;
 import androidx.media3.exoplayer.source.ads.AdsMediaSource;
 import androidx.media3.exoplayer.upstream.CmcdConfiguration;
+import androidx.media3.exoplayer.upstream.CmcdConfigurationFactory;
+import androidx.media3.exoplayer.upstream.CmcdEventReporter;
+import androidx.media3.exoplayer.upstream.CmcdV2Configuration;
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy;
 import androidx.media3.exoplayer.util.ReleasableExecutor;
 import androidx.media3.extractor.DefaultExtractorsFactory;
@@ -120,6 +125,8 @@ public final class DefaultMediaSourceFactory implements MediaSourceFactory {
   @Nullable private AdsLoader.Provider adsLoaderProvider;
   @Nullable private AdViewProvider adViewProvider;
   @Nullable private LoadErrorHandlingPolicy loadErrorHandlingPolicy;
+  @Nullable private CmcdConfigurationFactory cmcdConfigurationFactory;
+  @Nullable private CmcdEventReporter cmcdEventReporter;
   private long liveTargetOffsetMs;
   private long liveMinOffsetMs;
   private long liveMaxOffsetMs;
@@ -449,7 +456,30 @@ public final class DefaultMediaSourceFactory implements MediaSourceFactory {
   @Override
   public DefaultMediaSourceFactory setCmcdConfigurationFactory(
       CmcdConfiguration.Factory cmcdConfigurationFactory) {
-    delegateFactoryLoader.setCmcdConfigurationFactory(checkNotNull(cmcdConfigurationFactory));
+    return setCmcdConfigurationFactory((CmcdConfigurationFactory) checkNotNull(cmcdConfigurationFactory));
+  }
+
+  /**
+   * Sets the {@link CmcdConfigurationFactory} used to create version-specific CMCD configurations
+   * per {@link MediaItem}.
+   *
+   * <p>The factory can return a {@link CmcdConfiguration} for v1 behavior, a {@link
+   * CmcdV2Configuration} for v2 behavior, or {@code null} to disable CMCD for a specific media
+   * item.
+   *
+   * <p>When a v2 configuration with event targets is returned, a {@link CmcdEventReporter} will be
+   * started to handle Event Mode reporting. The reporter is stopped when the media item changes or
+   * when the source is released.
+   *
+   * @param cmcdConfigurationFactory The factory for creating CMCD configurations.
+   * @return This factory, for convenience.
+   */
+  @CanIgnoreReturnValue
+  @UnstableApi
+  public DefaultMediaSourceFactory setCmcdConfigurationFactory(
+      CmcdConfigurationFactory cmcdConfigurationFactory) {
+    this.cmcdConfigurationFactory = checkNotNull(cmcdConfigurationFactory);
+    delegateFactoryLoader.setCmcdConfigurationFactory(cmcdConfigurationFactory);
     return this;
   }
 
@@ -572,6 +602,10 @@ public final class DefaultMediaSourceFactory implements MediaSourceFactory {
               checkNotNull(externalImageLoader))
           .createMediaSource(mediaItem);
     }
+
+    // Manage CmcdEventReporter lifecycle on media item change.
+    manageCmcdEventReporter(mediaItem);
+
     @C.ContentType
     int type =
         Util.inferContentTypeForUriAndMimeType(
@@ -676,6 +710,48 @@ public final class DefaultMediaSourceFactory implements MediaSourceFactory {
 
   // internal methods
 
+  /**
+   * Manages the CmcdEventReporter lifecycle on media item change.
+   *
+   * <p>Stops any existing reporter, then creates and starts a new one if the configuration factory
+   * returns a {@link CmcdV2Configuration} with non-empty event targets for the given media item.
+   */
+  private void manageCmcdEventReporter(MediaItem mediaItem) {
+    // Stop existing event reporter on media item change.
+    stopCmcdEventReporter();
+
+    if (cmcdConfigurationFactory == null) {
+      return;
+    }
+
+    @Nullable CmcdConfiguration config = cmcdConfigurationFactory.createCmcdConfiguration(mediaItem);
+    if (config instanceof CmcdV2Configuration) {
+      CmcdV2Configuration v2Config = (CmcdV2Configuration) config;
+      if (!v2Config.eventTargets.isEmpty()) {
+        Handler handler = new Handler(Looper.getMainLooper());
+        cmcdEventReporter =
+            new CmcdEventReporter(
+                v2Config,
+                handler,
+                (target, error) ->
+                    Log.w(TAG, "CMCD event report failed for target: " + target.url, error));
+        cmcdEventReporter.start();
+      }
+    }
+  }
+
+  /**
+   * Stops and releases the current {@link CmcdEventReporter}, if one is active.
+   *
+   * <p>Called on media item change and when the source is released.
+   */
+  /* package */ void stopCmcdEventReporter() {
+    if (cmcdEventReporter != null) {
+      cmcdEventReporter.stop();
+      cmcdEventReporter = null;
+    }
+  }
+
   private static MediaSource maybeClipMediaSource(
       MediaItem mediaItem, MediaSource mediaSource, boolean enableClippingInMediaPeriod) {
     if (mediaItem.clippingConfiguration.startPositionUs == 0
@@ -736,7 +812,7 @@ public final class DefaultMediaSourceFactory implements MediaSourceFactory {
     private @C.VideoCodecFlags int codecsToParseWithinGopSampleDependencies;
     private boolean loadOnlySelectedTracks;
     private boolean experimentalEnableHagcPlayback;
-    @Nullable private CmcdConfiguration.Factory cmcdConfigurationFactory;
+    @Nullable private CmcdConfigurationFactory cmcdConfigurationFactory;
     @Nullable private DrmSessionManagerProvider drmSessionManagerProvider;
     @Nullable private LoadErrorHandlingPolicy loadErrorHandlingPolicy;
     @Nullable private Supplier<ReleasableExecutor> downloadExecutorSupplier;
@@ -769,7 +845,19 @@ public final class DefaultMediaSourceFactory implements MediaSourceFactory {
 
       mediaSourceFactory = mediaSourceFactorySupplier.get();
       if (cmcdConfigurationFactory != null) {
-        mediaSourceFactory.setCmcdConfigurationFactory(cmcdConfigurationFactory);
+        if (cmcdConfigurationFactory instanceof CmcdConfiguration.Factory) {
+          mediaSourceFactory.setCmcdConfigurationFactory(
+              (CmcdConfiguration.Factory) cmcdConfigurationFactory);
+        } else {
+          // Wrap the broader CmcdConfigurationFactory as a CmcdConfiguration.Factory for
+          // delegate media source factories that only accept the narrower type.
+          CmcdConfigurationFactory factory = cmcdConfigurationFactory;
+          mediaSourceFactory.setCmcdConfigurationFactory(
+              mediaItem -> {
+                CmcdConfiguration config = factory.createCmcdConfiguration(mediaItem);
+                return config;
+              });
+        }
       }
       if (drmSessionManagerProvider != null) {
         mediaSourceFactory.setDrmSessionManagerProvider(drmSessionManagerProvider);
@@ -822,10 +910,22 @@ public final class DefaultMediaSourceFactory implements MediaSourceFactory {
           codecsToParseWithinGopSampleDependencies);
     }
 
-    public void setCmcdConfigurationFactory(CmcdConfiguration.Factory cmcdConfigurationFactory) {
+    public void setCmcdConfigurationFactory(CmcdConfigurationFactory cmcdConfigurationFactory) {
       this.cmcdConfigurationFactory = cmcdConfigurationFactory;
       for (MediaSource.Factory mediaSourceFactory : mediaSourceFactories.values()) {
-        mediaSourceFactory.setCmcdConfigurationFactory(cmcdConfigurationFactory);
+        if (cmcdConfigurationFactory instanceof CmcdConfiguration.Factory) {
+          mediaSourceFactory.setCmcdConfigurationFactory(
+              (CmcdConfiguration.Factory) cmcdConfigurationFactory);
+        } else {
+          // Wrap the broader CmcdConfigurationFactory as a CmcdConfiguration.Factory for
+          // delegate media source factories that only accept the narrower type.
+          CmcdConfigurationFactory factory = cmcdConfigurationFactory;
+          mediaSourceFactory.setCmcdConfigurationFactory(
+              mediaItem -> {
+                CmcdConfiguration config = factory.createCmcdConfiguration(mediaItem);
+                return config;
+              });
+        }
       }
     }
 

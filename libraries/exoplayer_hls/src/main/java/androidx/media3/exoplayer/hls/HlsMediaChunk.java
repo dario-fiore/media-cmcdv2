@@ -35,6 +35,8 @@ import androidx.media3.exoplayer.analytics.PlayerId;
 import androidx.media3.exoplayer.hls.playlist.HlsMediaPlaylist;
 import androidx.media3.exoplayer.source.chunk.MediaChunk;
 import androidx.media3.exoplayer.upstream.CmcdData;
+import androidx.media3.exoplayer.upstream.CmcdV2Configuration;
+import androidx.media3.exoplayer.upstream.CmcdV2Data;
 import androidx.media3.extractor.DefaultExtractorInput;
 import androidx.media3.extractor.ExtractorInput;
 import androidx.media3.extractor.metadata.id3.Id3Decoder;
@@ -84,6 +86,8 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
    * @param isIndependent Whether the chunk starts with a keyframe.
    * @param playerId The {@link PlayerId} of the player.
    * @param cmcdDataFactory The {@link CmcdData.Factory} for generating {@link CmcdData}.
+   * @param cmcdV2DataFactory The {@link CmcdV2Data.Factory} for generating {@link CmcdV2Data}, or
+   *     {@code null} if v2 is not active.
    */
   public static HlsMediaChunk createInstance(
       HlsExtractorFactory extractorFactory,
@@ -106,7 +110,9 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
       boolean shouldSpliceIn,
       boolean isIndependent,
       PlayerId playerId,
-      @Nullable CmcdData.Factory cmcdDataFactory) {
+      @Nullable CmcdData.Factory cmcdDataFactory,
+      @Nullable CmcdV2Data.Factory cmcdV2DataFactory,
+      @Nullable CmcdV2Configuration cmcdV2Configuration) {
     // Media segment.
     HlsMediaPlaylist.SegmentBase mediaSegment = segmentBaseHolder.segmentBase;
     DataSpec dataSpec =
@@ -116,7 +122,10 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
             .setLength(mediaSegment.byteRangeLength)
             .setFlags(segmentBaseHolder.isPreload ? FLAG_MIGHT_NOT_USE_FULL_NETWORK_SPEED : 0)
             .build();
-    if (cmcdDataFactory != null) {
+    if (cmcdV2DataFactory != null) {
+      CmcdV2Data cmcdV2Data = cmcdV2DataFactory.createCmcdData();
+      dataSpec = cmcdV2Data.addToDataSpec(dataSpec, checkNotNull(cmcdV2Configuration));
+    } else if (cmcdDataFactory != null) {
       CmcdData cmcdData = cmcdDataFactory.createCmcdData();
       dataSpec = cmcdData.addToDataSpec(dataSpec);
     }
@@ -148,7 +157,14 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
               .setPosition(initSegment.byteRangeOffset)
               .setLength(initSegment.byteRangeLength)
               .build();
-      if (cmcdDataFactory != null) {
+      if (cmcdV2DataFactory != null) {
+        CmcdV2Data cmcdV2Data =
+            cmcdV2DataFactory
+                .setObjectType(CmcdData.OBJECT_TYPE_INIT_SEGMENT)
+                .createCmcdData();
+        initDataSpec =
+            cmcdV2Data.addToDataSpec(initDataSpec, checkNotNull(cmcdV2Configuration));
+      } else if (cmcdDataFactory != null) {
         CmcdData cmcdData =
             cmcdDataFactory.setObjectType(CmcdData.OBJECT_TYPE_INIT_SEGMENT).createCmcdData();
         initDataSpec = cmcdData.addToDataSpec(initDataSpec);

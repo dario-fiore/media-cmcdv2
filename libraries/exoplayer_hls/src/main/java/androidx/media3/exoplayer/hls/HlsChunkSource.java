@@ -54,6 +54,9 @@ import androidx.media3.exoplayer.trackselection.BaseTrackSelection;
 import androidx.media3.exoplayer.trackselection.ExoTrackSelection;
 import androidx.media3.exoplayer.upstream.CmcdConfiguration;
 import androidx.media3.exoplayer.upstream.CmcdData;
+import androidx.media3.exoplayer.upstream.CmcdV2Configuration;
+import androidx.media3.exoplayer.upstream.CmcdV2Data;
+import androidx.media3.exoplayer.upstream.CmcdV2Keys;
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy;
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy.FallbackOptions;
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy.FallbackSelection;
@@ -147,6 +150,12 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   private final PlayerId playerId;
   @Nullable private final CmcdConfiguration cmcdConfiguration;
   private final long timestampAdjusterInitializationTimeoutMs;
+
+  /**
+   * Monotonically increasing sequence number for CMCD v2 reports within this session. Tracks the
+   * sequence of CMCD reports to a target, reset to zero on new session-id per CTA-5004-B.
+   */
+  private long sequenceNumber;
 
   private boolean isPrimaryTimestampSource;
   private byte[] scratchSpace;
@@ -569,38 +578,107 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     nextChunkStuckOnPlaylistUrl = null;
 
     @Nullable CmcdData.Factory cmcdDataFactory = null;
+    @Nullable CmcdV2Data.Factory cmcdV2DataFactory = null;
     if (cmcdConfiguration != null) {
-      cmcdDataFactory =
-          new CmcdData.Factory(cmcdConfiguration, CmcdData.STREAMING_FORMAT_HLS)
-              .setTrackSelection(trackSelection)
-              .setBufferedDurationUs(max(0, bufferedDurationUs))
-              .setPlaybackRate(loadingInfo.playbackSpeed)
-              .setIsLive(!playlist.hasEndTag)
-              .setDidRebuffer(loadingInfo.rebufferedSince(lastChunkRequestRealtimeMs))
-              .setIsBufferEmpty(queue.isEmpty())
-              .setChunkDurationUs(segmentBaseHolder.segmentBase.durationUs);
-      long nextMediaSequence =
-          segmentBaseHolder.partIndex == C.INDEX_UNSET
-              ? segmentBaseHolder.mediaSequence + 1
-              : segmentBaseHolder.mediaSequence;
-      int nextPartIndex =
-          segmentBaseHolder.partIndex == C.INDEX_UNSET
-              ? C.INDEX_UNSET
-              : segmentBaseHolder.partIndex + 1;
-      SegmentBaseHolder nextSegmentBaseHolder =
-          getNextSegmentHolder(playlist, nextMediaSequence, nextPartIndex);
-      if (nextSegmentBaseHolder != null) {
-        Uri uri = UriUtil.resolveToUri(playlist.baseUri, segmentBaseHolder.segmentBase.url);
-        Uri nextUri = UriUtil.resolveToUri(playlist.baseUri, nextSegmentBaseHolder.segmentBase.url);
-        cmcdDataFactory.setNextObjectRequest(UriUtil.getRelativePath(uri, nextUri));
-
-        String nextRangeRequest = nextSegmentBaseHolder.segmentBase.byteRangeOffset + "-";
-        if (nextSegmentBaseHolder.segmentBase.byteRangeLength != C.LENGTH_UNSET) {
-          nextRangeRequest +=
-              (nextSegmentBaseHolder.segmentBase.byteRangeOffset
-                  + nextSegmentBaseHolder.segmentBase.byteRangeLength);
+      if (cmcdConfiguration instanceof CmcdV2Configuration) {
+        CmcdV2Configuration v2Config = (CmcdV2Configuration) cmcdConfiguration;
+        cmcdV2DataFactory =
+            new CmcdV2Data.Factory(v2Config, CmcdData.STREAMING_FORMAT_HLS);
+        // Populate v1-equivalent fields from track selection and playback state
+        Format selectedFormat = trackSelection.getSelectedFormat();
+        int selectedBitrateKbps = Util.ceilDivide(selectedFormat.bitrate, 1000);
+        cmcdV2DataFactory.setBitrate(selectedBitrateKbps);
+        int topBitrate = selectedFormat.bitrate;
+        for (int i = 0; i < trackSelection.getTrackGroup().length; i++) {
+          topBitrate = max(topBitrate, trackSelection.getTrackGroup().getFormat(i).bitrate);
         }
-        cmcdDataFactory.setNextRangeRequest(nextRangeRequest);
+        cmcdV2DataFactory.setTopBitrate(Util.ceilDivide(topBitrate, 1000));
+        cmcdV2DataFactory.setBufferLength(Util.usToMs(max(0, bufferedDurationUs)));
+        cmcdV2DataFactory.setPlaybackRate(loadingInfo.playbackSpeed);
+        if (loadingInfo.playbackSpeed != C.RATE_UNSET) {
+          cmcdV2DataFactory.setDeadline(
+              Util.usToMs((long) (max(0, bufferedDurationUs) / loadingInfo.playbackSpeed)));
+        }
+        if (trackSelection.getLatestBitrateEstimate() != C.RATE_UNSET_INT) {
+          cmcdV2DataFactory.setMeasuredThroughput(
+              Util.ceilDivide(trackSelection.getLatestBitrateEstimate(), 1000));
+        }
+        boolean didRebuffer = loadingInfo.rebufferedSince(lastChunkRequestRealtimeMs);
+        cmcdV2DataFactory.setStartup(didRebuffer || queue.isEmpty());
+        cmcdV2DataFactory.setBufferStarvation(didRebuffer);
+        cmcdV2DataFactory.setObjectDurationMs(
+            Util.usToMs(segmentBaseHolder.segmentBase.durationUs));
+        // Stream type: detect low-latency HLS or standard live/vod
+        if (!playlist.hasEndTag) {
+          if (playlist.partTargetDurationUs != C.TIME_UNSET) {
+            cmcdV2DataFactory.setStreamType(CmcdV2Keys.STREAM_TYPE_LOW_LATENCY_LIVE);
+          } else {
+            cmcdV2DataFactory.setStreamType(CmcdData.STREAM_TYPE_LIVE);
+          }
+        } else {
+          cmcdV2DataFactory.setStreamType(CmcdData.STREAM_TYPE_VOD);
+        }
+        // Sequence number: monotonically increasing per session
+        cmcdV2DataFactory.setSequenceNumber(sequenceNumber++);
+        // Next object request
+        long nextMediaSequence =
+            segmentBaseHolder.partIndex == C.INDEX_UNSET
+                ? segmentBaseHolder.mediaSequence + 1
+                : segmentBaseHolder.mediaSequence;
+        int nextPartIndex =
+            segmentBaseHolder.partIndex == C.INDEX_UNSET
+                ? C.INDEX_UNSET
+                : segmentBaseHolder.partIndex + 1;
+        SegmentBaseHolder nextSegmentBaseHolder =
+            getNextSegmentHolder(playlist, nextMediaSequence, nextPartIndex);
+        if (nextSegmentBaseHolder != null) {
+          Uri uri = UriUtil.resolveToUri(playlist.baseUri, segmentBaseHolder.segmentBase.url);
+          Uri nextUri =
+              UriUtil.resolveToUri(playlist.baseUri, nextSegmentBaseHolder.segmentBase.url);
+          cmcdV2DataFactory.setNextObjectRequest(UriUtil.getRelativePath(uri, nextUri));
+
+          String nextRangeRequest = nextSegmentBaseHolder.segmentBase.byteRangeOffset + "-";
+          if (nextSegmentBaseHolder.segmentBase.byteRangeLength != C.LENGTH_UNSET) {
+            nextRangeRequest +=
+                (nextSegmentBaseHolder.segmentBase.byteRangeOffset
+                    + nextSegmentBaseHolder.segmentBase.byteRangeLength);
+          }
+          cmcdV2DataFactory.setNextRangeRequest(nextRangeRequest);
+        }
+      } else {
+        cmcdDataFactory =
+            new CmcdData.Factory(cmcdConfiguration, CmcdData.STREAMING_FORMAT_HLS)
+                .setTrackSelection(trackSelection)
+                .setBufferedDurationUs(max(0, bufferedDurationUs))
+                .setPlaybackRate(loadingInfo.playbackSpeed)
+                .setIsLive(!playlist.hasEndTag)
+                .setDidRebuffer(loadingInfo.rebufferedSince(lastChunkRequestRealtimeMs))
+                .setIsBufferEmpty(queue.isEmpty())
+                .setChunkDurationUs(segmentBaseHolder.segmentBase.durationUs);
+        long nextMediaSequence =
+            segmentBaseHolder.partIndex == C.INDEX_UNSET
+                ? segmentBaseHolder.mediaSequence + 1
+                : segmentBaseHolder.mediaSequence;
+        int nextPartIndex =
+            segmentBaseHolder.partIndex == C.INDEX_UNSET
+                ? C.INDEX_UNSET
+                : segmentBaseHolder.partIndex + 1;
+        SegmentBaseHolder nextSegmentBaseHolder =
+            getNextSegmentHolder(playlist, nextMediaSequence, nextPartIndex);
+        if (nextSegmentBaseHolder != null) {
+          Uri uri = UriUtil.resolveToUri(playlist.baseUri, segmentBaseHolder.segmentBase.url);
+          Uri nextUri =
+              UriUtil.resolveToUri(playlist.baseUri, nextSegmentBaseHolder.segmentBase.url);
+          cmcdDataFactory.setNextObjectRequest(UriUtil.getRelativePath(uri, nextUri));
+
+          String nextRangeRequest = nextSegmentBaseHolder.segmentBase.byteRangeOffset + "-";
+          if (nextSegmentBaseHolder.segmentBase.byteRangeLength != C.LENGTH_UNSET) {
+            nextRangeRequest +=
+                (nextSegmentBaseHolder.segmentBase.byteRangeOffset
+                    + nextSegmentBaseHolder.segmentBase.byteRangeLength);
+          }
+          cmcdDataFactory.setNextRangeRequest(nextRangeRequest);
+        }
       }
     }
     lastChunkRequestRealtimeMs = SystemClock.elapsedRealtime();
@@ -611,7 +689,11 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
         getFullEncryptionKeyUri(playlist, segmentBaseHolder.segmentBase.initializationSegment);
     out.chunk =
         maybeCreateEncryptionChunkFor(
-            initSegmentKeyUri, selectedTrackIndex, /* isInitSegment= */ true, cmcdDataFactory);
+            initSegmentKeyUri,
+            selectedTrackIndex,
+            /* isInitSegment= */ true,
+            cmcdDataFactory,
+            cmcdV2DataFactory);
     if (out.chunk != null) {
       return;
     }
@@ -619,7 +701,11 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     Uri mediaSegmentKeyUri = getFullEncryptionKeyUri(playlist, segmentBaseHolder.segmentBase);
     out.chunk =
         maybeCreateEncryptionChunkFor(
-            mediaSegmentKeyUri, selectedTrackIndex, /* isInitSegment= */ false, cmcdDataFactory);
+            mediaSegmentKeyUri,
+            selectedTrackIndex,
+            /* isInitSegment= */ false,
+            cmcdDataFactory,
+            cmcdV2DataFactory);
     if (out.chunk != null) {
       return;
     }
@@ -663,7 +749,11 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
             shouldSpliceIn,
             isIndependent,
             playerId,
-            cmcdDataFactory);
+            cmcdDataFactory,
+            cmcdV2DataFactory,
+            cmcdConfiguration instanceof CmcdV2Configuration
+                ? (CmcdV2Configuration) cmcdConfiguration
+                : null);
   }
 
   private static boolean isIndependent(
@@ -1199,7 +1289,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       @Nullable Uri keyUri,
       int selectedTrackIndex,
       boolean isInitSegment,
-      @Nullable CmcdData.Factory cmcdDataFactory) {
+      @Nullable CmcdData.Factory cmcdDataFactory,
+      @Nullable CmcdV2Data.Factory cmcdV2DataFactory) {
     if (keyUri == null) {
       return null;
     }
@@ -1215,7 +1306,14 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
     DataSpec dataSpec =
         new DataSpec.Builder().setUri(keyUri).setFlags(DataSpec.FLAG_ALLOW_GZIP).build();
-    if (cmcdDataFactory != null) {
+    if (cmcdV2DataFactory != null) {
+      if (isInitSegment) {
+        cmcdV2DataFactory.setObjectType(CmcdData.OBJECT_TYPE_INIT_SEGMENT);
+      }
+      CmcdV2Data cmcdV2Data = cmcdV2DataFactory.createCmcdData();
+      dataSpec =
+          cmcdV2Data.addToDataSpec(dataSpec, (CmcdV2Configuration) cmcdConfiguration);
+    } else if (cmcdDataFactory != null) {
       if (isInitSegment) {
         cmcdDataFactory.setObjectType(CmcdData.OBJECT_TYPE_INIT_SEGMENT);
       }

@@ -26,6 +26,7 @@ import androidx.media3.common.Format;
 import androidx.media3.common.MimeTypes;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.common.util.UriUtil;
+import androidx.media3.common.util.Util;
 import androidx.media3.datasource.DataSource;
 import androidx.media3.datasource.DataSpec;
 import androidx.media3.datasource.TransferListener;
@@ -45,6 +46,8 @@ import androidx.media3.exoplayer.source.chunk.MediaChunkIterator;
 import androidx.media3.exoplayer.trackselection.ExoTrackSelection;
 import androidx.media3.exoplayer.upstream.CmcdConfiguration;
 import androidx.media3.exoplayer.upstream.CmcdData;
+import androidx.media3.exoplayer.upstream.CmcdV2Configuration;
+import androidx.media3.exoplayer.upstream.CmcdV2Data;
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy;
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy.FallbackOptions;
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy.FallbackSelection;
@@ -149,6 +152,12 @@ public class DefaultSsChunkSource implements SsChunkSource {
   private int currentManifestChunkOffset;
 
   @Nullable private IOException fatalError;
+
+  /**
+   * Monotonically increasing sequence number for CMCD v2 reports within a session. Incremented with
+   * each request when v2 configuration is active.
+   */
+  private long sequenceNumber;
 
   /**
    * The time at which the last {@link #getNextChunk(LoadingInfo, long, List, ChunkHolder)} method
@@ -355,20 +364,69 @@ public class DefaultSsChunkSource implements SsChunkSource {
     Uri uri = streamElement.buildRequestUri(manifestTrackIndex, chunkIndex);
 
     @Nullable CmcdData.Factory cmcdDataFactory = null;
+    @Nullable CmcdV2Data.Factory cmcdV2DataFactory = null;
     if (cmcdConfiguration != null) {
-      cmcdDataFactory =
-          new CmcdData.Factory(cmcdConfiguration, CmcdData.STREAMING_FORMAT_SS)
-              .setTrackSelection(trackSelection)
-              .setBufferedDurationUs(max(0, bufferedDurationUs))
-              .setPlaybackRate(loadingInfo.playbackSpeed)
-              .setIsLive(manifest.isLive)
-              .setDidRebuffer(loadingInfo.rebufferedSince(lastChunkRequestRealtimeMs))
-              .setIsBufferEmpty(queue.isEmpty())
-              .setChunkDurationUs(chunkEndTimeUs - chunkStartTimeUs);
+      if (cmcdConfiguration instanceof CmcdV2Configuration) {
+        // V2 path: use CmcdV2Data.Factory
+        CmcdV2Configuration v2Config = (CmcdV2Configuration) cmcdConfiguration;
+        cmcdV2DataFactory =
+            new CmcdV2Data.Factory(v2Config, CmcdData.STREAMING_FORMAT_SS)
+                .setPlaybackRate(loadingInfo.playbackSpeed)
+                .setStreamType(manifest.isLive ? CmcdData.STREAM_TYPE_LIVE : CmcdData.STREAM_TYPE_VOD)
+                .setBufferLength(Util.usToMs(max(0, bufferedDurationUs)))
+                .setObjectDurationMs(Util.usToMs(chunkEndTimeUs - chunkStartTimeUs))
+                .setSequenceNumber(sequenceNumber++);
 
-      if (chunkIndex + 1 < streamElement.chunkCount) {
-        Uri nextUri = streamElement.buildRequestUri(manifestTrackIndex, chunkIndex + 1);
-        cmcdDataFactory.setNextObjectRequest(UriUtil.getRelativePath(uri, nextUri));
+        // Set bitrate and top bitrate from track selection
+        int selectedTrackBitrate = trackSelection.getSelectedFormat().bitrate;
+        if (selectedTrackBitrate != Format.NO_VALUE) {
+          cmcdV2DataFactory.setBitrate(Util.ceilDivide(selectedTrackBitrate, 1000));
+        }
+        int topBitrate = selectedTrackBitrate;
+        for (int i = 0; i < trackSelection.getTrackGroup().length; i++) {
+          topBitrate = max(topBitrate, trackSelection.getTrackGroup().getFormat(i).bitrate);
+        }
+        if (topBitrate != Format.NO_VALUE) {
+          cmcdV2DataFactory.setTopBitrate(Util.ceilDivide(topBitrate, 1000));
+        }
+
+        // Set measured throughput if available
+        if (trackSelection.getLatestBitrateEstimate() != C.RATE_UNSET_INT) {
+          cmcdV2DataFactory.setMeasuredThroughput(
+              Util.ceilDivide(trackSelection.getLatestBitrateEstimate(), 1000));
+        }
+
+        // Set startup flag
+        if (loadingInfo.rebufferedSince(lastChunkRequestRealtimeMs) || queue.isEmpty()) {
+          cmcdV2DataFactory.setStartup(true);
+        }
+
+        // Set buffer starvation
+        if (loadingInfo.rebufferedSince(lastChunkRequestRealtimeMs)) {
+          cmcdV2DataFactory.setBufferStarvation(true);
+        }
+
+        // Set next object request
+        if (chunkIndex + 1 < streamElement.chunkCount) {
+          Uri nextUri = streamElement.buildRequestUri(manifestTrackIndex, chunkIndex + 1);
+          cmcdV2DataFactory.setNextObjectRequest(UriUtil.getRelativePath(uri, nextUri));
+        }
+      } else {
+        // V1 path: preserve existing behavior exactly
+        cmcdDataFactory =
+            new CmcdData.Factory(cmcdConfiguration, CmcdData.STREAMING_FORMAT_SS)
+                .setTrackSelection(trackSelection)
+                .setBufferedDurationUs(max(0, bufferedDurationUs))
+                .setPlaybackRate(loadingInfo.playbackSpeed)
+                .setIsLive(manifest.isLive)
+                .setDidRebuffer(loadingInfo.rebufferedSince(lastChunkRequestRealtimeMs))
+                .setIsBufferEmpty(queue.isEmpty())
+                .setChunkDurationUs(chunkEndTimeUs - chunkStartTimeUs);
+
+        if (chunkIndex + 1 < streamElement.chunkCount) {
+          Uri nextUri = streamElement.buildRequestUri(manifestTrackIndex, chunkIndex + 1);
+          cmcdDataFactory.setNextObjectRequest(UriUtil.getRelativePath(uri, nextUri));
+        }
       }
     }
     lastChunkRequestRealtimeMs = SystemClock.elapsedRealtime();
@@ -385,7 +443,11 @@ public class DefaultSsChunkSource implements SsChunkSource {
             trackSelection.getSelectionReason(),
             trackSelection.getSelectionData(),
             chunkExtractor,
-            cmcdDataFactory);
+            cmcdDataFactory,
+            cmcdV2DataFactory,
+            cmcdConfiguration instanceof CmcdV2Configuration
+                ? (CmcdV2Configuration) cmcdConfiguration
+                : null);
   }
 
   @Override
@@ -444,9 +506,14 @@ public class DefaultSsChunkSource implements SsChunkSource {
       @C.SelectionReason int trackSelectionReason,
       @Nullable Object trackSelectionData,
       ChunkExtractor chunkExtractor,
-      @Nullable CmcdData.Factory cmcdDataFactory) {
+      @Nullable CmcdData.Factory cmcdDataFactory,
+      @Nullable CmcdV2Data.Factory cmcdV2DataFactory,
+      @Nullable CmcdV2Configuration cmcdV2Configuration) {
     DataSpec dataSpec = new DataSpec.Builder().setUri(uri).build();
-    if (cmcdDataFactory != null) {
+    if (cmcdV2DataFactory != null && cmcdV2Configuration != null) {
+      CmcdV2Data cmcdV2Data = cmcdV2DataFactory.createCmcdData();
+      dataSpec = cmcdV2Data.addToDataSpec(dataSpec, cmcdV2Configuration);
+    } else if (cmcdDataFactory != null) {
       CmcdData cmcdData = cmcdDataFactory.createCmcdData();
       dataSpec = cmcdData.addToDataSpec(dataSpec);
     }

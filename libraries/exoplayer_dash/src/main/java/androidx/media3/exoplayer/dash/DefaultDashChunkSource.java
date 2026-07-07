@@ -43,6 +43,7 @@ import androidx.media3.exoplayer.dash.manifest.BaseUrl;
 import androidx.media3.exoplayer.dash.manifest.DashManifest;
 import androidx.media3.exoplayer.dash.manifest.RangedUri;
 import androidx.media3.exoplayer.dash.manifest.Representation;
+import androidx.media3.exoplayer.dash.manifest.ServiceDescriptionElement;
 import androidx.media3.exoplayer.source.BehindLiveWindowException;
 import androidx.media3.exoplayer.source.chunk.BaseMediaChunkIterator;
 import androidx.media3.exoplayer.source.chunk.BundledChunkExtractor;
@@ -57,6 +58,9 @@ import androidx.media3.exoplayer.source.chunk.SingleSampleMediaChunk;
 import androidx.media3.exoplayer.trackselection.ExoTrackSelection;
 import androidx.media3.exoplayer.upstream.CmcdConfiguration;
 import androidx.media3.exoplayer.upstream.CmcdData;
+import androidx.media3.exoplayer.upstream.CmcdV2Configuration;
+import androidx.media3.exoplayer.upstream.CmcdV2Data;
+import androidx.media3.exoplayer.upstream.CmcdV2Keys;
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy;
 import androidx.media3.exoplayer.upstream.LoaderErrorThrower;
 import androidx.media3.extractor.ChunkIndex;
@@ -206,6 +210,12 @@ public class DefaultDashChunkSource implements DashChunkSource {
   private int periodIndex;
   @Nullable private IOException fatalError;
   private boolean missingLastSegment;
+
+  /**
+   * Monotonically increasing sequence number for CMCD v2 reports within a session. Incremented with
+   * each CMCD request. Resets to 0 on new session (new CmcdConfiguration/session ID).
+   */
+  private long sequenceNumber;
 
   /**
    * The time at which the last {@link #getNextChunk(LoadingInfo, long, List, ChunkHolder)} method
@@ -426,16 +436,59 @@ public class DefaultDashChunkSource implements DashChunkSource {
     int selectedTrackIndex = trackSelection.getSelectedIndex();
 
     @Nullable
-    CmcdData.Factory cmcdDataFactory =
-        cmcdConfiguration == null
-            ? null
-            : new CmcdData.Factory(cmcdConfiguration, CmcdData.STREAMING_FORMAT_DASH)
+    CmcdData.Factory cmcdDataFactory = null;
+    @Nullable CmcdV2Data.Factory cmcdV2DataFactory = null;
+    if (cmcdConfiguration != null) {
+      if (cmcdConfiguration instanceof CmcdV2Configuration) {
+        CmcdV2Configuration v2Config = (CmcdV2Configuration) cmcdConfiguration;
+        cmcdV2DataFactory =
+            new CmcdV2Data.Factory(v2Config, CmcdData.STREAMING_FORMAT_DASH);
+        // Populate v1-equivalent fields from track selection and playback state
+        ExoTrackSelection ts = trackSelection;
+        Format selectedFormat = ts.getSelectedFormat();
+        int selectedBitrateKbps = Util.ceilDivide(selectedFormat.bitrate, 1000);
+        cmcdV2DataFactory.setBitrate(selectedBitrateKbps);
+        int topBitrate = selectedFormat.bitrate;
+        for (int i = 0; i < ts.getTrackGroup().length; i++) {
+          topBitrate = max(topBitrate, ts.getTrackGroup().getFormat(i).bitrate);
+        }
+        cmcdV2DataFactory.setTopBitrate(Util.ceilDivide(topBitrate, 1000));
+        cmcdV2DataFactory.setBufferLength(Util.usToMs(max(0, bufferedDurationUs)));
+        cmcdV2DataFactory.setPlaybackRate(loadingInfo.playbackSpeed);
+        if (loadingInfo.playbackSpeed != C.RATE_UNSET) {
+          cmcdV2DataFactory.setDeadline(
+              Util.usToMs((long) (max(0, bufferedDurationUs) / loadingInfo.playbackSpeed)));
+        }
+        if (ts.getLatestBitrateEstimate() != C.RATE_UNSET_INT) {
+          cmcdV2DataFactory.setMeasuredThroughput(
+              Util.ceilDivide(ts.getLatestBitrateEstimate(), 1000));
+        }
+        boolean didRebuffer = loadingInfo.rebufferedSince(lastChunkRequestRealtimeMs);
+        cmcdV2DataFactory.setStartup(didRebuffer || queue.isEmpty());
+        cmcdV2DataFactory.setBufferStarvation(didRebuffer);
+        // Stream type: detect low-latency or standard live/vod
+        if (manifest.dynamic) {
+          if (isLowLatencyStream()) {
+            cmcdV2DataFactory.setStreamType(CmcdV2Keys.STREAM_TYPE_LOW_LATENCY_LIVE);
+          } else {
+            cmcdV2DataFactory.setStreamType(CmcdData.STREAM_TYPE_LIVE);
+          }
+        } else {
+          cmcdV2DataFactory.setStreamType(CmcdData.STREAM_TYPE_VOD);
+        }
+        // Sequence number: monotonically increasing per session
+        cmcdV2DataFactory.setSequenceNumber(sequenceNumber++);
+      } else {
+        cmcdDataFactory =
+            new CmcdData.Factory(cmcdConfiguration, CmcdData.STREAMING_FORMAT_DASH)
                 .setTrackSelection(trackSelection)
                 .setBufferedDurationUs(max(0, bufferedDurationUs))
                 .setPlaybackRate(loadingInfo.playbackSpeed)
                 .setIsLive(manifest.dynamic)
                 .setDidRebuffer(loadingInfo.rebufferedSince(lastChunkRequestRealtimeMs))
                 .setIsBufferEmpty(queue.isEmpty());
+      }
+    }
     lastChunkRequestRealtimeMs = SystemClock.elapsedRealtime();
 
     RepresentationHolder representationHolder = updateSelectedBaseUrl(selectedTrackIndex);
@@ -460,7 +513,8 @@ public class DefaultDashChunkSource implements DashChunkSource {
                 trackSelection.getSelectionData(),
                 pendingInitializationUri,
                 pendingIndexUri,
-                cmcdDataFactory);
+                cmcdDataFactory,
+                cmcdV2DataFactory);
         return;
       }
     }
@@ -538,7 +592,8 @@ public class DefaultDashChunkSource implements DashChunkSource {
             maxSegmentCount,
             seekTimeUs,
             nowPeriodTimeUs,
-            cmcdDataFactory);
+            cmcdDataFactory,
+            cmcdV2DataFactory);
   }
 
   @Override
@@ -710,6 +765,23 @@ public class DefaultDashChunkSource implements DashChunkSource {
   }
 
   /**
+   * Determines whether the current DASH stream is a low-latency stream.
+   *
+   * <p>A stream is considered low-latency if the manifest is dynamic and has a {@link
+   * ServiceDescriptionElement} with a defined target offset (indicating low-latency DASH
+   * configuration with latency targets).
+   */
+  private boolean isLowLatencyStream() {
+    if (!manifest.dynamic) {
+      return false;
+    }
+    // A ServiceDescriptionElement with a defined targetOffsetMs indicates low-latency DASH
+    // configuration (LL-DASH uses <ServiceDescription> with <Latency> element).
+    return manifest.serviceDescription != null
+        && manifest.serviceDescription.targetOffsetMs != C.TIME_UNSET;
+  }
+
+  /**
    * Creates a new {@link Chunk} for initialization.
    *
    * @param representationHolder The {@link Representation} holder for initialization.
@@ -721,7 +793,9 @@ public class DefaultDashChunkSource implements DashChunkSource {
    *     indexUri} is not {@code null}.
    * @param indexUri The URI pointing to index data. Can be {@code null} if {@code
    *     initializationUri} is not {@code null}.
-   * @param cmcdDataFactory The {@link CmcdData.Factory} for generating {@link CmcdData}.
+   * @param cmcdDataFactory The {@link CmcdData.Factory} for generating {@link CmcdData} (v1).
+   * @param cmcdV2DataFactory The {@link CmcdV2Data.Factory} for generating {@link CmcdV2Data}
+   *     (v2).
    */
   @RequiresNonNull("#1.chunkExtractor")
   protected Chunk newInitializationChunk(
@@ -732,7 +806,8 @@ public class DefaultDashChunkSource implements DashChunkSource {
       @Nullable Object trackSelectionData,
       @Nullable RangedUri initializationUri,
       @Nullable RangedUri indexUri,
-      @Nullable CmcdData.Factory cmcdDataFactory) {
+      @Nullable CmcdData.Factory cmcdDataFactory,
+      @Nullable CmcdV2Data.Factory cmcdV2DataFactory) {
     Representation representation = representationHolder.representation;
     RangedUri requestUri;
     if (initializationUri != null) {
@@ -753,7 +828,11 @@ public class DefaultDashChunkSource implements DashChunkSource {
             requestUri,
             /* flags= */ 0,
             /* httpRequestHeaders= */ ImmutableMap.of());
-    if (cmcdDataFactory != null) {
+    if (cmcdV2DataFactory != null) {
+      cmcdV2DataFactory.setObjectType(CmcdData.OBJECT_TYPE_INIT_SEGMENT);
+      CmcdV2Data cmcdV2Data = cmcdV2DataFactory.createCmcdData();
+      dataSpec = cmcdV2Data.addToDataSpec(dataSpec, (CmcdV2Configuration) cmcdConfiguration);
+    } else if (cmcdDataFactory != null) {
       CmcdData cmcdData =
           cmcdDataFactory.setObjectType(CmcdData.OBJECT_TYPE_INIT_SEGMENT).createCmcdData();
       dataSpec = cmcdData.addToDataSpec(dataSpec);
@@ -782,7 +861,8 @@ public class DefaultDashChunkSource implements DashChunkSource {
       int maxSegmentCount,
       long seekTimeUs,
       long nowPeriodTimeUs,
-      @Nullable CmcdData.Factory cmcdDataFactory) {
+      @Nullable CmcdData.Factory cmcdDataFactory,
+      @Nullable CmcdV2Data.Factory cmcdV2DataFactory) {
     Representation representation = representationHolder.representation;
     long startTimeUs = representationHolder.getSegmentStartTimeUs(firstSegmentNum);
     RangedUri segmentUri = representationHolder.getSegmentUrl(firstSegmentNum);
@@ -800,7 +880,19 @@ public class DefaultDashChunkSource implements DashChunkSource {
               segmentUri,
               flags,
               /* httpRequestHeaders= */ ImmutableMap.of());
-      if (cmcdDataFactory != null) {
+      if (cmcdV2DataFactory != null) {
+        cmcdV2DataFactory.setObjectDurationMs(Util.usToMs(endTimeUs - startTimeUs));
+        @Nullable
+        Pair<String, String> nextObjectAndRangeRequest =
+            getNextObjectAndRangeRequest(firstSegmentNum, segmentUri, representationHolder);
+        if (nextObjectAndRangeRequest != null) {
+          cmcdV2DataFactory
+              .setNextObjectRequest(nextObjectAndRangeRequest.first)
+              .setNextRangeRequest(nextObjectAndRangeRequest.second);
+        }
+        CmcdV2Data cmcdV2Data = cmcdV2DataFactory.createCmcdData();
+        dataSpec = cmcdV2Data.addToDataSpec(dataSpec, (CmcdV2Configuration) cmcdConfiguration);
+      } else if (cmcdDataFactory != null) {
         cmcdDataFactory.setChunkDurationUs(endTimeUs - startTimeUs);
         @Nullable
         Pair<String, String> nextObjectAndRangeRequest =
@@ -857,7 +949,19 @@ public class DefaultDashChunkSource implements DashChunkSource {
               segmentUri,
               flags,
               /* httpRequestHeaders= */ ImmutableMap.of());
-      if (cmcdDataFactory != null) {
+      if (cmcdV2DataFactory != null) {
+        cmcdV2DataFactory.setObjectDurationMs(Util.usToMs(endTimeUs - startTimeUs));
+        @Nullable
+        Pair<String, String> nextObjectAndRangeRequest =
+            getNextObjectAndRangeRequest(firstSegmentNum, segmentUri, representationHolder);
+        if (nextObjectAndRangeRequest != null) {
+          cmcdV2DataFactory
+              .setNextObjectRequest(nextObjectAndRangeRequest.first)
+              .setNextRangeRequest(nextObjectAndRangeRequest.second);
+        }
+        CmcdV2Data cmcdV2Data = cmcdV2DataFactory.createCmcdData();
+        dataSpec = cmcdV2Data.addToDataSpec(dataSpec, (CmcdV2Configuration) cmcdConfiguration);
+      } else if (cmcdDataFactory != null) {
         cmcdDataFactory.setChunkDurationUs(endTimeUs - startTimeUs);
         @Nullable
         Pair<String, String> nextObjectAndRangeRequest =

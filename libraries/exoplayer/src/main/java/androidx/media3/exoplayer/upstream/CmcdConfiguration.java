@@ -34,7 +34,7 @@ import java.util.UUID;
 
 /** Represents a configuration for the Common Media Client Data (CMCD) logging. */
 @UnstableApi
-public final class CmcdConfiguration {
+public class CmcdConfiguration {
 
   /**
    * Header keys SHOULD be allocated to one of the four defined header names based upon their
@@ -122,7 +122,7 @@ public final class CmcdConfiguration {
    * <p>Implementations must not make assumptions about which thread called their methods; and must
    * be thread-safe.
    */
-  public interface Factory {
+  public interface Factory extends CmcdConfigurationFactory {
     /**
      * Creates a {@link CmcdConfiguration} based on the provided {@link MediaItem}.
      *
@@ -257,8 +257,26 @@ public final class CmcdConfiguration {
       @Nullable String contentId,
       RequestConfig requestConfig,
       @DataTransmissionMode int dataTransmissionMode) {
+    this(sessionId, contentId, requestConfig, dataTransmissionMode, MAX_ID_LENGTH);
+  }
+
+  /**
+   * Creates an instance with a custom maximum content ID length for subclass use.
+   *
+   * @param sessionId The session ID.
+   * @param contentId The content ID.
+   * @param requestConfig The request configuration.
+   * @param dataTransmissionMode The data transmission mode.
+   * @param maxContentIdLength The maximum allowed content ID length.
+   */
+  protected CmcdConfiguration(
+      @Nullable String sessionId,
+      @Nullable String contentId,
+      RequestConfig requestConfig,
+      @DataTransmissionMode int dataTransmissionMode,
+      int maxContentIdLength) {
     checkArgument(sessionId == null || sessionId.length() <= MAX_ID_LENGTH);
-    checkArgument(contentId == null || contentId.length() <= MAX_ID_LENGTH);
+    checkArgument(contentId == null || contentId.length() <= maxContentIdLength);
     checkNotNull(requestConfig);
     this.sessionId = sessionId;
     this.contentId = contentId;
